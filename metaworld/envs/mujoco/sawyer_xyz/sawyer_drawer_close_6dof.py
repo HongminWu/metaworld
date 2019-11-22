@@ -43,14 +43,14 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
             'obj_init_pos': np.array([0., 0.9, 0.04], dtype=np.float32),
             'hand_init_pos': np.array([0, 0.6, 0.2], dtype=np.float32),
         }
-        self.goal = np.array([0., 0.55, 0.04])
+        self.goal = np.array([0., 0.9, 0.04])
         self.obj_init_pos = self.init_config['obj_init_pos']
         self.obj_init_angle = self.init_config['obj_init_angle']
         self.hand_init_pos = self.init_config['hand_init_pos']
 
         if goal_low is None:
             goal_low = self.hand_low
-        
+
         if goal_high is None:
             goal_high = self.hand_high
 
@@ -87,23 +87,35 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
         )
         self.goal_space = Box(np.array(goal_low), np.array(goal_high))
         if self.obs_type == 'plain':
-            self.observation_space = Box(
+            observation_space = Box(
                 np.hstack((self.hand_low, obj_low,)),
                 np.hstack((self.hand_high, obj_high,)),
             )
         elif self.obs_type == 'with_goal':
-            self.observation_space = Box(
+            observation_space = Box(
                 np.hstack((self.hand_low, obj_low, goal_low)),
                 np.hstack((self.hand_high, obj_high, goal_high)),
             )
         else:
             raise NotImplementedError
+        self.observation_space = Dict([
+            ('observation', observation_space),
+            ('desired_goal', self.goal_space),
+            ('achieved_goal', self.goal_space),
+            ('state_observation', observation_space),
+            ('state_desired_goal', self.goal_space),
+            ('state_achieved_goal', self.goal_space),
+        ])
         self.reset()
 
     def get_goal(self):
         return {
             'state_desired_goal': self._state_goal,
-    }
+        }
+
+    def reset(self):
+        ob = super().reset()
+        return self._get_obs_dict()
 
     @property
     def model_name(self):
@@ -133,9 +145,9 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
             done = True
         else:
             done = False
-        info = {'reachDist': reachDist, 'goalDist': pullDist, 'epRew' : reward, 'pickRew':None, 'success': float(pullDist <= 0.06)}
+        info = {'reachDist': reachDist, 'goalDist': pullDist, 'epRew' : reward, 'pickRew':0, 'success': float(pullDist <= 0.06)}
         info['goal'] = self._state_goal
-        return ob, reward, done, info
+        return obs_dict, reward, done, info
 
     def _get_obs(self):
         hand = self.get_endeff_pos()
@@ -162,14 +174,14 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
         objPos =  self.data.get_geom_xpos('handle')
         flat_obs = np.concatenate((hand, objPos))
         return dict(
-            state_observation=flat_obs,
-            state_desired_goal=self._state_goal,
-            state_achieved_goal=objPos,
+            state_observation=flat_obs.copy(),
+            state_desired_goal=self._state_goal.copy(),
+            state_achieved_goal=objPos.copy(),
         )
 
     def _get_info(self):
         pass
-    
+
     def _set_goal_marker(self, goal):
         """
         This should be use ONLY for visualization. Use self._state_goal for
@@ -188,7 +200,7 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
         self.data.site_xpos[self.model.site_name2id('objSite')] = (
             objPos
         )
-    
+
 
     def _set_obj_xyz_quat(self, pos, angle):
         quat = Quaternion(axis = [0,0,1], angle = angle).elements
@@ -206,6 +218,9 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
         qpos[9] = pos
         # qvel[9:15] = 0
         self.set_state(qpos, qvel)
+
+    def set_to_goal(self, goal):
+        pass
 
     def reset_model(self):
         self._reset_hand()
@@ -258,35 +273,55 @@ class SawyerDrawerClose6DOFEnv(SawyerXYZEnv):
         #Required by HER-TD3
         assert isinstance(obsBatch, dict) == True
         obsList = obsBatch['state_observation']
-        rewards = [self.compute_reward(action, obs)[0] for  action, obs in zip(actions, obsList)]
+
+        rewards = []
+        for i in range(len(actions)):
+            obs = {}
+            for k in obsBatch:
+                obs[k] = obsBatch[k][i, :]
+            action = actions[i, :]
+            r = self.compute_reward(action, obs)[0]
+            rewards.append(r)
+
+        # print(rewards)
+
+        # rewards = [self.compute_reward(action, obs)[0] for  action, obs in zip(actions, obsList)]
+
         return np.array(rewards)
 
     def compute_reward(self, actions, obs):
-        if isinstance(obs, dict): 
-            obs = obs['state_observation']
+        assert isinstance(obs, dict)
 
+        pullGoal = obs["state_desired_goal"][1]
+        obs = obs['state_observation']
+
+        fingerCOM = obs[:3]
         objPos = obs[3:6]
 
-        rightFinger, leftFinger = self.get_site_pos('rightEndEffector'), self.get_site_pos('leftEndEffector')
-        fingerCOM  =  (rightFinger + leftFinger)/2
+        # rightFinger, leftFinger = self.get_site_pos('rightEndEffector'), self.get_site_pos('leftEndEffector')
+        # fingerCOM  =  (rightFinger + leftFinger)/2
 
-        pullGoal = self._state_goal[1]
+        # pullGoal = self._state_goal[1]
 
         reachDist = np.linalg.norm(objPos - fingerCOM)
 
         pullDist = np.abs(objPos[1] - pullGoal)
 
-        # reward = -reachDist - pullDist
-        c1 = 1000 ; c2 = 0.01 ; c3 = 0.001
-        if reachDist < 0.05:
-            # pullRew = -pullDist
-            pullRew = 1000*(self.maxDist - pullDist) + c1*(np.exp(-(pullDist**2)/c2) + np.exp(-(pullDist**2)/c3))
-            pullRew = max(pullRew, 0)
-        else:
-            pullRew = 0
-        reward = -reachDist + pullRew
-      
-        return [reward, reachDist, pullDist] 
+        reward = -pullDist # 0 if pullDist < 0.06 else -1
+
+        # print(reward, pullGoal, objPos[1])
+
+        # # reward = -reachDist - pullDist
+        # c1 = 1000 ; c2 = 0.01 ; c3 = 0.001
+        # if reachDist < 0.05:
+        #     # pullRew = -pullDist
+        #     pullRew = 1000*(self.maxDist - pullDist) + c1*(np.exp(-(pullDist**2)/c2) + np.exp(-(pullDist**2)/c3))
+        #     pullRew = max(pullRew, 0)
+        # else:
+        #     pullRew = 0
+        # reward = -reachDist + pullRew
+
+        return [reward, reachDist, pullDist]
 
     def get_diagnostics(self, paths, prefix=''):
         statistics = OrderedDict()

@@ -52,10 +52,10 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
 
         if goal_low is None:
             goal_low = self.hand_low
-        
+
         if goal_high is None:
             goal_high = self.hand_high
-        
+
         assert obs_type in OBS_TYPE
         self.obs_type = obs_type
         self.random_init = random_init
@@ -88,23 +88,35 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
         )
         self.goal_space = Box(np.array(goal_low), np.array(goal_high))
         if self.obs_type == 'plain':
-            self.observation_space = Box(
+            observation_space = Box(
                 np.hstack((self.hand_low, obj_low,)),
                 np.hstack((self.hand_high, obj_high,)),
             )
         elif self.obs_type == 'with_goal':
-            self.observation_space = Box(
+            observation_space = Box(
                 np.hstack((self.hand_low, obj_low, goal_low)),
                 np.hstack((self.hand_high, obj_high, goal_high)),
             )
         else:
             raise NotImplementedError
+        self.observation_space = Dict([
+            ('observation', observation_space),
+            ('desired_goal', self.goal_space),
+            ('achieved_goal', self.goal_space),
+            ('state_observation', observation_space),
+            ('state_desired_goal', self.goal_space),
+            ('state_achieved_goal', self.goal_space),
+        ])
         self.reset()
 
     def get_goal(self):
         return {
             'state_desired_goal': self._state_goal,
     }
+
+    def reset(self):
+        ob = super().reset()
+        return self._get_obs_dict()
 
     @property
     def model_name(self):
@@ -135,9 +147,9 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
             done = True
         else:
             done = False
-        info = {'reachDist': reachDist, 'goalDist': pullDist, 'epRew' : reward, 'pickRew':None, 'success': float(pullDist <= 0.08)}
+        info = {'reachDist': reachDist, 'goalDist': pullDist, 'epRew' : reward, 'pickRew':0, 'success': float(pullDist <= 0.08)}
         info['goal'] = self._state_goal
-        return ob, reward, done, info
+        return obs_dict, reward, done, info
 
     def _get_obs(self):
         hand = self.get_endeff_pos()
@@ -169,13 +181,13 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
         flat_obs = np.concatenate((hand, objPos))
         return dict(
             state_observation=flat_obs,
-            state_desired_goal=self._state_goal,
+            state_desired_goal=self._state_goal.copy(),
             state_achieved_goal=objPos,
         )
 
     def _get_info(self):
         pass
-    
+
     def _set_goal_marker(self, goal):
         """
         This should be use ONLY for visualization. Use self._state_goal for
@@ -194,7 +206,7 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
         self.data.site_xpos[self.model.site_name2id('objSite')] = (
             objPos
         )
-    
+
 
     def _set_obj_xyz_quat(self, pos, angle):
         quat = Quaternion(axis = [0,0,1], angle = angle).elements
@@ -212,6 +224,9 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
         qpos[9] = pos
         # qvel[9:15] = 0
         self.set_state(qpos, qvel)
+
+    def set_to_goal(self, goal):
+        pass
 
     def reset_model(self):
         self._reset_hand()
@@ -266,19 +281,33 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
         #Required by HER-TD3
         assert isinstance(obsBatch, dict) == True
         obsList = obsBatch['state_observation']
-        rewards = [self.compute_reward(action, obs)[0] for  action, obs in zip(actions, obsList)]
+
+        rewards = []
+        for i in range(len(actions)):
+            obs = {}
+            for k in obsBatch:
+                obs[k] = obsBatch[k][i, :]
+            action = actions[i, :]
+            r = self.compute_reward(action, obs)[0]
+            rewards.append(r)
+
+        # rewards = [self.compute_reward(action, obs)[0] for  action, obs in zip(actions, obsList)]
+
         return np.array(rewards)
 
     def compute_reward(self, actions, obs):
-        if isinstance(obs, dict): 
-            obs = obs['state_observation']
+        # import ipdb; ipdb.set_trace()
 
+        assert isinstance(obs, dict)
+
+        pullGoal = obs["state_desired_goal"] # self._state_goal
+        obs = obs['state_observation']
+
+        fingerCOM = obs[:3]
         objPos = obs[3:6]
 
-        rightFinger, leftFinger = self.get_site_pos('rightEndEffector'), self.get_site_pos('leftEndEffector')
-        fingerCOM  =  (rightFinger + leftFinger)/2
-
-        pullGoal = self._state_goal
+        # rightFinger, leftFinger = self.get_site_pos('rightEndEffector'), self.get_site_pos('leftEndEffector')
+        # fingerCOM  =  (rightFinger + leftFinger)/2
 
         pullDist = np.abs(objPos[1] - pullGoal[1])
         reachDist = np.linalg.norm(objPos - fingerCOM)
@@ -316,8 +345,8 @@ class SawyerDrawerOpen6DOFEnv(SawyerXYZEnv):
         # pullRew = -pullDist
         pullRew = pullReward()
         reward = reachRew + pullRew# - actions[-1]/50
-      
-        return [reward, reachDist, pullDist] 
+
+        return [reward, reachDist, pullDist]
 
     def get_diagnostics(self, paths, prefix=''):
         statistics = OrderedDict()

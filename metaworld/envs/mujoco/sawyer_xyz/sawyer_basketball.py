@@ -85,17 +85,25 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
         )
         self.goal_space = Box(np.array(goal_low), np.array(goal_high))
         if self.obs_type == 'plain':
-            self.observation_space = Box(
+            observation_space = Box(
                 np.hstack((self.hand_low, obj_low,)),
                 np.hstack((self.hand_high, obj_high,)),
             )
         elif self.obs_type == 'with_goal':
-            self.observation_space = Box(
+            observation_space = Box(
                 np.hstack((self.hand_low, obj_low, goal_low)),
                 np.hstack((self.hand_high, obj_high, goal_high)),
             )
         else:
             raise NotImplementedError
+        self.observation_space = Dict([
+            ('observation', observation_space),
+            ('desired_goal', self.goal_space),
+            ('achieved_goal', self.goal_space),
+            ('state_observation', observation_space),
+            ('state_desired_goal', self.goal_space),
+            ('state_achieved_goal', self.goal_space),
+        ])
         self.reset()
 
     def get_goal(self):
@@ -133,7 +141,11 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
             done = False
         info = {'reachDist': reachDist, 'goalDist': placingDist, 'epRew' : reward, 'pickRew':pickRew, 'success': float(placingDist <= 0.08)}
         info['goal'] = self._state_goal
-        return ob, reward, done, info
+        return obs_dict, reward, done, info
+
+    def reset(self):
+        ob = super().reset()
+        return self._get_obs_dict()
 
     def _get_obs(self):
         hand = self.get_endeff_pos()
@@ -160,14 +172,14 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
         objPos =  self.data.get_geom_xpos('objGeom')
         flat_obs = np.concatenate((hand, objPos))
         return dict(
-            state_observation=flat_obs,
-            state_desired_goal=self._state_goal,
-            state_achieved_goal=objPos,
+            state_observation=flat_obs.copy(),
+            state_desired_goal=self._state_goal.copy(),
+            state_achieved_goal=objPos.copy(),
         )
 
     def _get_info(self):
         pass
-    
+
     def _set_goal_marker(self, goal):
         """
         This should be use ONLY for visualization. Use self._state_goal for
@@ -186,7 +198,7 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
         self.data.site_xpos[self.model.site_name2id('objSite')] = (
             objPos
         )
-    
+
 
     def _set_obj_xyz_quat(self, pos, angle):
         quat = Quaternion(axis = [0,0,1], angle = angle).elements
@@ -214,10 +226,16 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
         #The convention we follow is that body_com[2] is always 0, and geom_pos[2] is the object height
         return [adjustedPos[0], adjustedPos[1],self.data.get_geom_xpos('objGeom')[-1]]
 
+    def set_to_goal(self, goal):
+        pass
+        # import ipdb; ipdb.set_trace()
+        # state_goal = goal['state_desired_goal']
+        # basket_pos = goal_pos[3:]
+        # self._set_obj_xyz(basket_pos)
 
     def reset_model(self):
         self._reset_hand()
-        
+
         basket_pos = self.goal.copy()
         self.sim.model.body_pos[self.model.body_name2id('basket_goal')] = basket_pos
         self._state_goal = self.data.site_xpos[self.model.site_name2id('goal')]
@@ -265,24 +283,36 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
         #Required by HER-TD3
         assert isinstance(obsBatch, dict) == True
         obsList = obsBatch['state_observation']
-        rewards = [self.compute_reward(action, obs)[0] for  action, obs in zip(actions, obsList)]
+        # rewards = [self.compute_reward(action, obs)[0] for  action, obs in zip(actions, obsList)]
+
+        rewards = []
+        for i in range(len(actions)):
+            obs = {}
+            for k in obsBatch:
+                obs[k] = obsBatch[k][i, :]
+            action = actions[i, :]
+            r = self.compute_reward(action, obs)[0]
+            rewards.append(r)
+
         return np.array(rewards)
 
     def compute_reward(self, actions, obs, mode = 'orig'):
         if isinstance(obs, dict):
+            goal = obs["state_desired_goal"]
             obs = obs['state_observation']
 
+        if len(obs) == 3:
+            import pdb; pdb.set_trace()
         objPos = obs[3:6]
 
         rightFinger, leftFinger = self.get_site_pos('rightEndEffector'), self.get_site_pos('leftEndEffector')
         fingerCOM  =  (rightFinger + leftFinger)/2
 
         heightTarget = self.heightTarget
-        goal = self._state_goal
 
         reachDist = np.linalg.norm(objPos - fingerCOM)
         placingDist = np.linalg.norm(objPos - goal)
-        assert np.all(goal == self.get_site_pos('goal'))
+        # assert np.all(goal == self.get_site_pos('goal'))
 
         def reachReward():
             reachRew = -reachDist# + min(actions[-1], -1)/50
@@ -309,15 +339,15 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
 
 
         def objDropped():
-            return (objPos[2] < (self.objHeight + 0.005)) and (placingDist >0.02) and (reachDist > 0.02) 
+            return (objPos[2] < (self.objHeight + 0.005)) and (placingDist >0.02) and (reachDist > 0.02)
             # Object on the ground, far away from the goal, and from the gripper
             #Can tweak the margin limits
-       
+
         def objGrasped(thresh = 0):
             sensorData = self.data.sensordata
             return (sensorData[0]>thresh) and (sensorData[1]> thresh)
 
-        def orig_pickReward():       
+        def orig_pickReward():
             # hScale = 50
             hScale = 100
             # hScale = 1000
@@ -370,13 +400,13 @@ class SawyerBasketball6DOFEnv(SawyerXYZEnv):
     def log_diagnostics(self, paths = None, logger = None):
         pass
 
-if __name__ == '__main__':  
-    import time 
-    env = SawyerBasketball6DOFEnv(random_init=True)    
-    for _ in range(1000):   
+if __name__ == '__main__':
+    import time
+    env = SawyerBasketball6DOFEnv(random_init=True)
+    for _ in range(1000):
         env.reset()
         for _ in range(50):
             env.render()
             env.step(env.action_space.sample())
-            # env.step(np.array([np.random.uniform(low=-1., high=1.), np.random.uniform(low=-1., high=1.), 0.]))   
+            # env.step(np.array([np.random.uniform(low=-1., high=1.), np.random.uniform(low=-1., high=1.), 0.]))
             time.sleep(0.05)
